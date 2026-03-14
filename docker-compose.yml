@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  finance-ai:
+    build: .
+    container_name: finance-ai
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL}
+      - FEISHU_APP_ID=${FEISHU_APP_ID}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+      - TZ=Asia/Shanghai
+      - PYTHONPATH=/app
+    volumes:
+      - qlib_data:/root/.qlib
+      - cache_data:/root/.finance_ai
+      - chart_output:/tmp/finance_ai_charts
+    restart: unless-stopped
+    # Override CMD for specific tasks:
+    #   docker-compose run finance-ai python3 scripts/init_data.py --market csi300
+    #   docker-compose run finance-ai python3 skill/handler.py query 600519
+    #   docker-compose run finance-ai python3 skill/handler.py analyze 600519
+
+  # OpenClaw agent (optional - uncomment when ready)
+  # openclaw:
+  #   image: openclaw/openclaw:latest
+  #   container_name: openclaw
+  #   environment:
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #     - FEISHU_APP_ID=${FEISHU_APP_ID}
+  #     - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+  #   volumes:
+  #     - openclaw_data:/root/.openclaw
+  #     - ./:/root/.openclaw/workspace/skills/finance-ai:ro
+  #     - chart_output:/tmp/finance_ai_charts
+  #   ports:
+  #     - "3000:3000"
+  #   restart: unless-stopped
+
+volumes:
+  qlib_data:
+    driver: local
+  cache_data:
+    driver: local
+  chart_output:
+    driver: local
+  # openclaw_data:
+  #   driver: local

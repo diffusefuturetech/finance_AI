@@ -1,0 +1,31 @@
+[project]
+name = "finance-ai"
+version = "0.1.0"
+description = "A-share stock market quantitative analysis tool with Qlib + Claude AI"
+requires-python = ">=3.11"
+dependencies = [
+    "akshare>=1.14.0",
+    "baostock>=0.8.8",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyqlib>=0.9.0",
+    "TA-Lib>=0.4.28",
+    "matplotlib>=3.7.0",
+    "anthropic>=0.40.0",
+    "pyyaml>=6.0",
+    "apscheduler>=3.10.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["config*", "data*", "analysis*", "ai*", "charts*", "skill*"]

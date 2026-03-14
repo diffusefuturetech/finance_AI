@@ -1,0 +1,45 @@
+# Qlib model and dataset configuration
+
+# LightGBM model
+model:
+  class: LGBModel
+  module_path: qlib.contrib.model.gbdt
+  kwargs:
+    loss: mse
+    colsample_bytree: 0.8879
+    learning_rate: 0.0421
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    max_depth: 8
+    num_leaves: 210
+    num_threads: 4
+
+# Dataset with Alpha158 handler
+dataset:
+  class: DatasetH
+  module_path: qlib.data.dataset
+  kwargs:
+    handler:
+      class: Alpha158
+      module_path: qlib.contrib.data.handler
+    segments:
+      train: ["2015-01-01", "2022-12-31"]
+      valid: ["2023-01-01", "2024-06-30"]
+      test: ["2024-07-01", "2026-03-14"]
+
+# Backtest configuration
+backtest:
+  strategy:
+    class: TopkDropoutStrategy
+    module_path: qlib.contrib.strategy
+    kwargs:
+      topk: 30
+      n_drop: 5
+  executor:
+    class: SimulatorExecutor
+    module_path: qlib.backtest.executor
+    kwargs:
+      time_per_step: day
+  account: 100000000
+  benchmark: SH000300
