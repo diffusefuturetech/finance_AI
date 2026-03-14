@@ -144,8 +144,8 @@ class SkillHandler:
             # Get fundamental data
             fundamental = self.fetcher.get_financial_data(code)
 
-            # Factor scores (multi-dimensional)
-            factor_scores = self._compute_factor_scores(quote, fundamental)
+            # Factor scores (multi-dimensional, connected to technical signals)
+            factor_scores = self._compute_factor_scores(quote, fundamental, signals)
             factor_score = (
                 sum(factor_scores.values()) / len(factor_scores)
                 if factor_scores else None
@@ -157,6 +157,17 @@ class SkillHandler:
                     factor_scores, code, name
                 )
 
+            # Get historical valuation for percentile chart
+            valuation_path = None
+            try:
+                val_df = self.fetcher.get_historical_valuation(code)
+                if not val_df.empty:
+                    valuation_path = self.plotter.plot_valuation_history(
+                        val_df, code, name
+                    )
+            except Exception as e:
+                logger.warning(f"Historical valuation chart failed: {e}")
+
             # Generate AI report
             report = self.reporter.generate_stock_report(
                 symbol=code,
@@ -165,6 +176,7 @@ class SkillHandler:
                 technical_signals=signals,
                 fundamental_data=fundamental,
                 factor_score=factor_score,
+                factor_scores=factor_scores,
             )
 
             # Export to Word if requested
@@ -181,6 +193,7 @@ class SkillHandler:
                     ai_commentary=report,
                     technical_chart_path=chart_path,
                     radar_chart_path=radar_path,
+                    valuation_chart_path=valuation_path,
                 )
                 return f"Word报告已生成: {docx_path}"
 
@@ -200,45 +213,86 @@ class SkillHandler:
         except Exception as e:
             return self.formatter.format_error(f"分析失败: {e}")
 
-    def _compute_factor_scores(self, quote: dict, fundamental: dict) -> dict[str, float]:
-        """Compute multi-dimensional factor scores from quote and fundamental data."""
-        scores = {}
+    def _compute_factor_scores(
+        self, quote: dict, fundamental: dict, signals: dict | None = None,
+    ) -> dict[str, float]:
+        """Compute multi-dimensional factor scores using sigmoid curves.
 
+        Dimensions: 价值, 质量, 成长, 动量, 盈利质量, 安全
+        """
+        import math
+
+        def sigmoid(x: float, center: float, steepness: float) -> float:
+            """Sigmoid mapping to 0-100 scale, centered at `center`."""
+            try:
+                return 100 / (1 + math.exp(steepness * (x - center)))
+            except OverflowError:
+                return 0.0 if steepness * (x - center) > 0 else 100.0
+
+        scores = {}
         pe = quote.get("pe") or (fundamental or {}).get("pe_ttm")
         pb = quote.get("pb") or (fundamental or {}).get("pb")
         fd = fundamental or {}
 
-        # Value score
+        # 价值 (Value): lower PE/PB = higher score, sigmoid curve
+        value_parts = []
         if pe is not None and pe != 0:
             if pe > 0:
-                scores["价值"] = max(0, min(100, 100 - pe * 2))
+                # Center at PE=25, steepness 0.15: PE=10→85, PE=25→50, PE=50→15
+                value_parts.append(sigmoid(pe, 25, 0.15))
             else:
-                scores["价值"] = max(0, min(100, 100 - abs(pe)))
+                # Negative PE (loss-making) → low value score
+                value_parts.append(max(0, 10 - abs(pe) * 0.02))
         if pb is not None and pb > 0:
-            pb_score = max(0, min(100, 100 - pb * 10))
-            scores["价值"] = (scores.get("价值", 50) + pb_score) / 2
+            # Center at PB=3, steepness 1.5: PB=1→95, PB=3→50, PB=6→5
+            value_parts.append(sigmoid(pb, 3, 1.5))
+        if value_parts:
+            scores["价值"] = round(sum(value_parts) / len(value_parts), 1)
 
-        # Quality score
+        # 质量 (Quality): ROE sigmoid centered at 12% (A-share median)
         roe = fd.get("roe")
         if roe is not None:
-            scores["质量"] = max(0, min(100, roe * 4 + 20))
+            # Center at ROE=12%, steepness -0.3: ROE=25→98, ROE=12→50, ROE=0→3
+            scores["质量"] = round(sigmoid(roe, 12, -0.3), 1)
 
-        # Growth score
+        # 成长 (Growth): revenue + profit growth
         rev_g = fd.get("revenue_growth")
         prof_g = fd.get("profit_growth")
         if rev_g is not None or prof_g is not None:
             g_vals = [v for v in [rev_g, prof_g] if v is not None]
             avg_g = sum(g_vals) / len(g_vals)
-            scores["成长"] = max(0, min(100, avg_g * 2 + 50))
+            # Center at 15% growth, steepness -0.1
+            scores["成长"] = round(sigmoid(avg_g, 15, -0.1), 1)
 
-        # Momentum score (from technical signals)
-        tech_score = 50  # default neutral
-        scores["动量"] = tech_score
+        # 动量 (Momentum): from technical signals score (-100~100 → 0~100)
+        if signals and "score" in signals:
+            scores["动量"] = round((signals["score"] + 100) / 2, 1)
+        else:
+            scores["动量"] = 50.0
 
-        # Safety score (lower debt = safer)
+        # 盈利质量 (Earnings Quality): OCF/EPS ratio
+        ocfps = fd.get("ocfps")
+        eps = fd.get("eps")
+        if ocfps is not None and eps is not None and abs(eps) > 0.001:
+            ocf_eps_ratio = ocfps / eps
+            # Center at 0.8 ratio, steepness -3: ratio=1.5→92, ratio=0.8→50, ratio=0→8
+            scores["盈利质量"] = round(sigmoid(ocf_eps_ratio, 0.8, -3), 1)
+        elif eps is not None and eps < 0:
+            scores["盈利质量"] = 10.0  # Loss-making → poor quality
+
+        # 安全 (Safety): debt ratio + liquidity
         debt = fd.get("debt_ratio")
+        current = fd.get("current_ratio")
         if debt is not None:
-            scores["安全"] = max(0, min(100, 100 - debt))
+            # Center at 50% debt, steepness 0.08
+            safety = sigmoid(debt, 50, 0.08)
+            # Boost/penalize based on current ratio if available
+            if current is not None:
+                if current >= 2.0:
+                    safety = min(100, safety + 10)
+                elif current < 1.0:
+                    safety = max(0, safety - 15)
+            scores["安全"] = round(safety, 1)
 
         return scores
 

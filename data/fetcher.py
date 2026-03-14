@@ -452,6 +452,49 @@ class StockDataFetcher:
 
         return result
 
+    def get_historical_valuation(self, symbol: str, years: int = 3) -> pd.DataFrame:
+        """Get historical PE/PB/PS from BaoStock for valuation percentile analysis.
+
+        Returns:
+            DataFrame with columns: date, pe, pb, ps
+        """
+        code = self._resolve_symbol(symbol)
+        bs_code = f"sh.{code}" if code.startswith(("6", "9")) else f"sz.{code}"
+        end_dt = date.today()
+        start_dt = date(end_dt.year - years, end_dt.month, end_dt.day)
+
+        try:
+            bs.login()
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,peTTM,pbMRQ,psTTM",
+                start_date=start_dt.strftime("%Y-%m-%d"),
+                end_date=end_dt.strftime("%Y-%m-%d"),
+                frequency="d",
+                adjustflag="3",
+            )
+            rows = []
+            while (rs.error_code == "0") and rs.next():
+                rows.append(rs.get_row_data())
+            bs.logout()
+        except Exception as e:
+            logger.warning(f"Historical valuation failed for {code}: {e}")
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            return pd.DataFrame()
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=["date", "pe", "pb", "ps"])
+        for col in ["pe", "pb", "ps"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Filter out invalid values (0, extreme outliers)
+        df = df[(df["pe"].abs() < 1e6) & (df["pb"].abs() < 1e6)]
+        return df
+
     @staticmethod
     def _safe_float(val) -> float | None:
         """Safely convert to float, returning None for invalid values."""

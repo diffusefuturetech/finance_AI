@@ -71,25 +71,27 @@ class AIReporter:
         technical_signals: dict,
         fundamental_data: dict | None = None,
         factor_score: float | None = None,
+        factor_scores: dict[str, float] | None = None,
     ) -> str:
         """Generate comprehensive stock analysis report."""
+        from datetime import datetime
+
+        fd = fundamental_data or {}
+
         # Format technical signals
         signal_lines = []
+        label_map = {
+            "macd_signal": "MACD", "rsi_signal": "RSI", "kdj_signal": "KDJ",
+            "boll_signal": "布林带", "ma_alignment": "均线排列",
+        }
         for key, value in technical_signals.items():
-            if key not in ("score", "overall"):
-                label = {
-                    "macd_signal": "MACD",
-                    "rsi_signal": "RSI",
-                    "kdj_signal": "KDJ",
-                    "boll_signal": "布林带",
-                    "ma_alignment": "均线排列",
-                }.get(key, key)
-                signal_lines.append(f"- {label}: {value}")
+            if key in label_map:
+                signal_lines.append(f"- {label_map[key]}: {value}")
         signal_lines.append(f"- 综合评估: {technical_signals.get('overall', '未知')}")
         signal_lines.append(f"- 技术评分: {technical_signals.get('score', 'N/A')}")
 
         # Format market cap
-        market_cap = quote.get("total_market_cap", 0)
+        market_cap = quote.get("total_market_cap", 0) or fd.get("total_mv", 0)
         if market_cap > 1e12:
             market_cap_str = f"{market_cap/1e12:.1f}万亿"
         elif market_cap > 1e8:
@@ -97,37 +99,40 @@ class AIReporter:
         else:
             market_cap_str = f"{market_cap:.0f}"
 
-        # Format volume
+        # Format volume / amount
         volume = quote.get("volume", 0)
         volume_str = f"{volume/10000:.1f}万手" if volume > 10000 else f"{volume:.0f}手"
-
-        # Format amount
         amount = quote.get("amount", 0)
         amount_str = f"{amount/1e8:.2f}亿" if amount > 1e8 else f"{amount/1e4:.1f}万"
 
-        # PE/PB from fundamental data
-        pe_val = quote.get("pe") or (fundamental_data or {}).get("pe_ttm", "N/A")
-        pb_val = quote.get("pb") or (fundamental_data or {}).get("pb", "N/A")
+        # Factor breakdown
+        if factor_scores:
+            factor_lines = [f"- {k}: {v:.1f}" for k, v in factor_scores.items()]
+            avg = sum(factor_scores.values()) / len(factor_scores)
+            factor_lines.append(f"- 综合得分: {avg:.1f}")
+            factor_breakdown = "\n".join(factor_lines)
+        else:
+            factor_breakdown = f"综合得分: {factor_score:.1f}" if factor_score is not None else "未计算"
 
-        # Add extra fundamental info if available
-        extra_fundamental = ""
-        if fundamental_data:
-            fd = fundamental_data
-            parts = []
-            if fd.get("roe") is not None:
-                parts.append(f"- ROE: {fd['roe']}%")
-            if fd.get("gross_margin") is not None:
-                parts.append(f"- 毛利率: {fd['gross_margin']}%")
-            if fd.get("net_margin") is not None:
-                parts.append(f"- 净利率: {fd['net_margin']}%")
-            if fd.get("revenue_growth") is not None:
-                parts.append(f"- 营收增长率: {fd['revenue_growth']}%")
-            if fd.get("profit_growth") is not None:
-                parts.append(f"- 净利润增长率: {fd['profit_growth']}%")
-            if fd.get("debt_ratio") is not None:
-                parts.append(f"- 资产负债率: {fd['debt_ratio']}%")
-            if parts:
-                extra_fundamental = "\n\n## 财务指标\n" + "\n".join(parts)
+        # Data freshness
+        report_date = fd.get("report_date", "")
+        data_age_days = "未知"
+        freshness_warning = ""
+        if report_date:
+            try:
+                rd = datetime.strptime(str(report_date)[:10], "%Y-%m-%d")
+                age = (datetime.now() - rd).days
+                data_age_days = str(age)
+                if age > 180:
+                    freshness_warning = "\n  ⚠️ 财报数据超过180天，请关注最新财报披露"
+            except (ValueError, TypeError):
+                pass
+
+        # Helper to format optional values
+        def fv(val, suffix=""):
+            if val is None:
+                return "N/A"
+            return f"{val}{suffix}"
 
         prompt = STOCK_ANALYSIS_PROMPT.format(
             stock_name=name,
@@ -137,17 +142,31 @@ class AIReporter:
             volume=volume_str,
             amount=amount_str,
             turnover_rate=quote.get("turnover_rate", "N/A"),
-            technical_signals="\n".join(signal_lines),
-            pe=pe_val,
-            pb=pb_val,
+            pe=fv(quote.get("pe") or fd.get("pe_ttm")),
+            pb=fv(quote.get("pb") or fd.get("pb")),
+            ps=fv(quote.get("ps") or fd.get("ps_ttm")),
             market_cap=market_cap_str,
-            factor_score=f"{factor_score:.1f}" if factor_score is not None else "未计算",
+            eps=fv(fd.get("eps"), "元"),
+            bps=fv(fd.get("bps"), "元"),
+            ocfps=fv(fd.get("ocfps"), "元"),
+            roe=fv(fd.get("roe"), "%"),
+            gross_margin=fv(fd.get("gross_margin"), "%"),
+            net_margin=fv(fd.get("net_margin"), "%"),
+            operating_margin=fv(fd.get("operating_margin"), "%"),
+            revenue_growth=fv(fd.get("revenue_growth"), "%"),
+            profit_growth=fv(fd.get("profit_growth"), "%"),
+            debt_ratio=fv(fd.get("debt_ratio"), "%"),
+            current_ratio=fv(fd.get("current_ratio")),
+            quick_ratio=fv(fd.get("quick_ratio")),
+            technical_signals="\n".join(signal_lines),
+            factor_breakdown=factor_breakdown,
+            industry=fd.get("industry", "未知"),
+            report_date=report_date or "未知",
+            data_age_days=data_age_days,
+            data_freshness_warning=freshness_warning,
         )
 
-        if extra_fundamental:
-            prompt += extra_fundamental
-
-        return self._call_llm(prompt)
+        return self._call_llm(prompt, max_tokens=3000)
 
     def generate_market_summary(
         self,

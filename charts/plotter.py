@@ -47,7 +47,7 @@ class ChartPlotter:
         name: str,
         last_n: int = 120,
     ) -> str:
-        """Multi-panel dashboard: candlestick + volume + MACD + KDJ.
+        """Multi-panel dashboard: candlestick+Bollinger + volume + MACD + KDJ + RSI.
 
         Args:
             df: OHLCV DataFrame
@@ -62,12 +62,12 @@ class ChartPlotter:
         dates = pd.to_datetime(df["date"])
         x = np.arange(len(dates))
 
-        fig, axes = plt.subplots(4, 1, figsize=(14, 12),
-                                  gridspec_kw={"height_ratios": [3, 1, 1.2, 1.2]},
+        fig, axes = plt.subplots(5, 1, figsize=(14, 15),
+                                  gridspec_kw={"height_ratios": [3, 1, 1.2, 1.2, 1.2]},
                                   sharex=True)
         fig.suptitle(f"{name}（{symbol}）技术分析", fontsize=16, fontweight="bold")
 
-        # Panel 1: Candlestick + MA
+        # Panel 1: Candlestick + MA + Bollinger Bands
         ax1 = axes[0]
         close = df["close"].values.astype(float)
         open_p = df["open"].values.astype(float)
@@ -82,7 +82,6 @@ class ChartPlotter:
             body_height = abs(close[i] - open_p[i])
             ax1.bar(x[i], body_height, bottom=body_bottom, width=0.6,
                     color=colors[i], edgecolor=colors[i])
-            # Wicks
             ax1.vlines(x[i], low[i], high[i], colors=colors[i], linewidth=0.8)
 
         # Moving averages overlay
@@ -94,8 +93,26 @@ class ChartPlotter:
                     vals = ma_df[col].values
                     valid = ~np.isnan(vals)
                     ax1.plot(x[valid], vals[valid], color=color, linewidth=1, label=col.upper())
-            ax1.legend(loc="upper left", fontsize=8)
 
+        # Bollinger Bands overlay
+        if "bollinger" in indicators:
+            boll_df = indicators["bollinger"].tail(last_n).reset_index(drop=True)
+            for col in ["upper", "middle", "lower"]:
+                if col in boll_df.columns:
+                    vals = boll_df[col].values
+                    valid = ~np.isnan(vals)
+                    style = "--" if col != "middle" else ":"
+                    ax1.plot(x[valid], vals[valid], color="#9E9E9E", linewidth=0.8,
+                             linestyle=style, label=f"BOLL-{col[0].upper()}" if col != "middle" else "BOLL-M")
+            # Fill between upper and lower
+            if "upper" in boll_df.columns and "lower" in boll_df.columns:
+                upper = boll_df["upper"].values
+                lower = boll_df["lower"].values
+                valid = ~(np.isnan(upper) | np.isnan(lower))
+                ax1.fill_between(x[valid], upper[valid], lower[valid],
+                                 color="#9E9E9E", alpha=0.08)
+
+        ax1.legend(loc="upper left", fontsize=7, ncol=4)
         ax1.set_ylabel("价格")
         ax1.grid(True, alpha=0.3)
 
@@ -147,10 +164,35 @@ class ChartPlotter:
         ax4.set_ylabel("KDJ")
         ax4.grid(True, alpha=0.3)
 
-        # X-axis date labels
+        # Panel 5: RSI
+        ax5 = axes[4]
+        if "rsi" in indicators:
+            rsi_df = indicators["rsi"].tail(last_n).reset_index(drop=True)
+            rsi_styles = [
+                ("rsi_6", "#2962FF", "RSI(6)"),
+                ("rsi_12", "#FF6D00", "RSI(12)"),
+                ("rsi_24", "#AB47BC", "RSI(24)"),
+            ]
+            for col, color, label in rsi_styles:
+                if col in rsi_df.columns:
+                    vals = rsi_df[col].values
+                    valid = ~np.isnan(vals)
+                    ax5.plot(x[valid], vals[valid], color=color, linewidth=1, label=label)
+            ax5.axhline(y=70, color="#ef5350", linewidth=0.5, linestyle="--", alpha=0.7)
+            ax5.axhline(y=30, color="#26a69a", linewidth=0.5, linestyle="--", alpha=0.7)
+            ax5.axhline(y=50, color="gray", linewidth=0.3, linestyle=":")
+            ax5.fill_between(x, 70, 100, color="#ef5350", alpha=0.05)
+            ax5.fill_between(x, 0, 30, color="#26a69a", alpha=0.05)
+            ax5.set_ylim(0, 100)
+            ax5.legend(loc="upper left", fontsize=8)
+
+        ax5.set_ylabel("RSI")
+        ax5.grid(True, alpha=0.3)
+
+        # X-axis date labels on bottom panel
         tick_step = max(1, len(x) // 10)
-        ax4.set_xticks(x[::tick_step])
-        ax4.set_xticklabels(
+        ax5.set_xticks(x[::tick_step])
+        ax5.set_xticklabels(
             [dates.iloc[i].strftime("%m-%d") for i in range(0, len(dates), tick_step)],
             rotation=45, fontsize=8,
         )
@@ -219,3 +261,83 @@ class ChartPlotter:
 
         fig.tight_layout()
         return self._save_fig(fig, f"radar_{symbol}")
+
+    def plot_valuation_history(
+        self,
+        val_df: pd.DataFrame,
+        symbol: str,
+        name: str = "",
+    ) -> str:
+        """Historical PE/PB valuation chart with percentile bands.
+
+        Args:
+            val_df: DataFrame with columns: date, pe, pb, ps
+            symbol: stock code
+            name: stock name
+
+        Returns: path to saved PNG
+        """
+        if val_df.empty:
+            return ""
+
+        dates = pd.to_datetime(val_df["date"])
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        fig.suptitle(f"{name}（{symbol}）历史估值分位", fontsize=14, fontweight="bold")
+
+        for ax, col, label, color in [
+            (ax1, "pe", "PE(TTM)", "#2962FF"),
+            (ax2, "pb", "PB(MRQ)", "#FF6D00"),
+        ]:
+            if col not in val_df.columns:
+                continue
+            vals = val_df[col].dropna()
+            if vals.empty:
+                continue
+
+            # Filter positive values for PE (negative PE is meaningless for bands)
+            if col == "pe":
+                plot_vals = vals[vals > 0]
+            else:
+                plot_vals = vals[vals > 0]
+
+            if plot_vals.empty:
+                ax.text(0.5, 0.5, f"{label}: 数据不足", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=12, color="gray")
+                continue
+
+            plot_dates = dates[plot_vals.index]
+            mean_val = plot_vals.mean()
+            std_val = plot_vals.std()
+            current = plot_vals.iloc[-1]
+            percentile = (plot_vals < current).sum() / len(plot_vals) * 100
+
+            # Main line
+            ax.plot(plot_dates, plot_vals, color=color, linewidth=1.2, label=label)
+
+            # Mean line
+            ax.axhline(y=mean_val, color="#666666", linewidth=1, linestyle="--",
+                       label=f"均值 {mean_val:.1f}")
+
+            # ±1σ bands
+            ax.axhline(y=mean_val + std_val, color="#BDBDBD", linewidth=0.8, linestyle=":")
+            ax.axhline(y=mean_val - std_val, color="#BDBDBD", linewidth=0.8, linestyle=":")
+            ax.fill_between(plot_dates, mean_val - std_val, mean_val + std_val,
+                            color=color, alpha=0.06)
+
+            # Current value marker
+            ax.scatter([plot_dates.iloc[-1]], [current], color="#ef5350", s=80, zorder=5,
+                       edgecolors="white", linewidth=1.5)
+            ax.annotate(f"当前 {current:.1f}\n({percentile:.0f}%分位)",
+                        xy=(plot_dates.iloc[-1], current),
+                        xytext=(10, 10), textcoords="offset points",
+                        fontsize=9, color="#ef5350", fontweight="bold",
+                        arrowprops=dict(arrowstyle="->", color="#ef5350", lw=1))
+
+            ax.set_ylabel(label)
+            ax.legend(loc="upper left", fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        return self._save_fig(fig, f"valuation_{symbol}")
