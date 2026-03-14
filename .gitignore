@@ -37,3 +37,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Generated reports
+*.docx

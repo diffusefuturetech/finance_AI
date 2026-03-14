@@ -120,7 +120,7 @@ class SkillHandler:
         except Exception as e:
             return self.formatter.format_error(f"选股失败: {e}")
 
-    def handle_analyze(self, target: str) -> str:
+    def handle_analyze(self, target: str, export_docx: bool = False) -> str:
         """Handle full AI analysis report generation."""
         try:
             # Get real-time quote
@@ -132,6 +132,7 @@ class SkillHandler:
             df = self.fetcher.get_daily_history(code)
             signals = {}
             chart_path = None
+            radar_path = None
             if df is not None and not df.empty:
                 analyzer = TechnicalAnalyzer(df)
                 signals = analyzer.generate_signals()
@@ -143,18 +144,18 @@ class SkillHandler:
             # Get fundamental data
             fundamental = self.fetcher.get_financial_data(code)
 
-            # Factor score (simplified - from quote data)
-            factor_score = None
-            try:
-                pe = quote.get("pe") or 0
-                pb = quote.get("pb") or 0
-                if pe > 0 and pb > 0:
-                    # Simple heuristic score
-                    pe_score = max(0, 100 - pe * 2)
-                    pb_score = max(0, 100 - pb * 10)
-                    factor_score = (pe_score + pb_score) / 2
-            except Exception:
-                pass
+            # Factor scores (multi-dimensional)
+            factor_scores = self._compute_factor_scores(quote, fundamental)
+            factor_score = (
+                sum(factor_scores.values()) / len(factor_scores)
+                if factor_scores else None
+            )
+
+            # Generate radar chart if factor scores available
+            if factor_scores:
+                radar_path = self.plotter.plot_factor_radar(
+                    factor_scores, code, name
+                )
 
             # Generate AI report
             report = self.reporter.generate_stock_report(
@@ -166,13 +167,30 @@ class SkillHandler:
                 factor_score=factor_score,
             )
 
+            # Export to Word if requested
+            if export_docx:
+                from ai.docx_export import DocxExporter
+                exporter = DocxExporter()
+                docx_path = exporter.generate_stock_report(
+                    symbol=code,
+                    name=name,
+                    quote=quote,
+                    fundamental=fundamental,
+                    signals=signals,
+                    factor_scores=factor_scores,
+                    ai_commentary=report,
+                    technical_chart_path=chart_path,
+                    radar_chart_path=radar_path,
+                )
+                return f"Word报告已生成: {docx_path}"
+
             # Compose full output
             output_parts = [
                 self.formatter.format_quote(quote),
                 "",
                 self.formatter.format_technical_signals(signals, chart_path),
                 "",
-                "## 🤖 AI 分析报告",
+                "## AI 分析报告",
                 "",
                 report,
             ]
@@ -181,6 +199,48 @@ class SkillHandler:
 
         except Exception as e:
             return self.formatter.format_error(f"分析失败: {e}")
+
+    def _compute_factor_scores(self, quote: dict, fundamental: dict) -> dict[str, float]:
+        """Compute multi-dimensional factor scores from quote and fundamental data."""
+        scores = {}
+
+        pe = quote.get("pe") or (fundamental or {}).get("pe_ttm")
+        pb = quote.get("pb") or (fundamental or {}).get("pb")
+        fd = fundamental or {}
+
+        # Value score
+        if pe is not None and pe != 0:
+            if pe > 0:
+                scores["价值"] = max(0, min(100, 100 - pe * 2))
+            else:
+                scores["价值"] = max(0, min(100, 100 - abs(pe)))
+        if pb is not None and pb > 0:
+            pb_score = max(0, min(100, 100 - pb * 10))
+            scores["价值"] = (scores.get("价值", 50) + pb_score) / 2
+
+        # Quality score
+        roe = fd.get("roe")
+        if roe is not None:
+            scores["质量"] = max(0, min(100, roe * 4 + 20))
+
+        # Growth score
+        rev_g = fd.get("revenue_growth")
+        prof_g = fd.get("profit_growth")
+        if rev_g is not None or prof_g is not None:
+            g_vals = [v for v in [rev_g, prof_g] if v is not None]
+            avg_g = sum(g_vals) / len(g_vals)
+            scores["成长"] = max(0, min(100, avg_g * 2 + 50))
+
+        # Momentum score (from technical signals)
+        tech_score = 50  # default neutral
+        scores["动量"] = tech_score
+
+        # Safety score (lower debt = safer)
+        debt = fd.get("debt_ratio")
+        if debt is not None:
+            scores["安全"] = max(0, min(100, 100 - debt))
+
+        return scores
 
     def handle_backtest(self, market: str, period: str) -> str:
         """Handle backtesting request."""
@@ -352,6 +412,7 @@ def main():
     # analyze
     analyze_p = subparsers.add_parser("analyze", help="Full AI analysis")
     analyze_p.add_argument("target", help="Stock code or name")
+    analyze_p.add_argument("--docx", action="store_true", help="Export as Word document")
 
     # backtest
     bt_p = subparsers.add_parser("backtest", help="Strategy backtest")
@@ -375,7 +436,7 @@ def main():
         "query": lambda: handler.handle_query(args.target),
         "technical": lambda: handler.handle_technical(args.target, args.period),
         "screen": lambda: handler.handle_screen(args.strategy, getattr(args, "top_n", 20)),
-        "analyze": lambda: handler.handle_analyze(args.target),
+        "analyze": lambda: handler.handle_analyze(args.target, getattr(args, "docx", False)),
         "backtest": lambda: handler.handle_backtest(args.market, args.period),
         "market": lambda: handler.handle_market(),
     }
