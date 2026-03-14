@@ -25,6 +25,8 @@ class StockDataFetcher:
     def get_realtime_quote(self, symbol: str) -> dict:
         """Get current price, change%, volume for a single stock.
 
+        Uses Sina Finance API (lightweight, single-stock) with EastMoney as fallback.
+
         Args:
             symbol: Stock code like '000001' or '600519', or stock name like '贵州茅台'
 
@@ -33,10 +35,81 @@ class StockDataFetcher:
                            volume, amount, open, high, low, prev_close, timestamp
         """
         code = self._resolve_symbol(symbol)
+        try:
+            return self._quote_sina(code)
+        except Exception as e:
+            logger.warning(f"Sina quote failed for {code}: {e}, trying EastMoney")
+            return self._quote_em(code)
+
+    def _quote_sina(self, code: str) -> dict:
+        """Get realtime quote from Sina Finance API (fast, single-stock)."""
+        import requests as req
+
+        prefix = "sh" if code.startswith(("6", "9")) else "sz"
+        url = f"https://hq.sinajs.cn/list={prefix}{code}"
+        headers = {"Referer": "https://finance.sina.com.cn"}
+        r = req.get(url, headers=headers, timeout=10)
+        r.encoding = "gbk"
+
+        # Parse: var hq_str_sz002795="name,today_open,prev_close,price,high,low,..."
+        text = r.text.strip()
+        if '=""' in text or not text:
+            raise ValueError(f"Empty Sina response for {code}")
+
+        data_str = text.split('"')[1]
+        fields = data_str.split(",")
+        if len(fields) < 32:
+            raise ValueError(f"Unexpected Sina data format for {code}")
+
+        name = fields[0]
+        today_open = float(fields[1]) if fields[1] else 0
+        prev_close = float(fields[2]) if fields[2] else 0
+        price = float(fields[3]) if fields[3] else 0
+        high = float(fields[4]) if fields[4] else 0
+        low = float(fields[5]) if fields[5] else 0
+        volume = float(fields[8]) if fields[8] else 0  # shares
+        amount = float(fields[9]) if fields[9] else 0   # yuan
+
+        change_amount = price - prev_close if prev_close > 0 else 0
+        change_pct = (change_amount / prev_close * 100) if prev_close > 0 else 0
+
+        # Get extra info (market cap, turnover) from EastMoney individual info
+        pe, pb, total_mv, turnover_rate = None, None, 0, 0
+        try:
+            info_df = ak.stock_individual_info_em(symbol=code)
+            info_dict = dict(zip(info_df["item"], info_df["value"]))
+            total_mv = float(info_dict.get("总市值", 0))
+            float_shares = float(info_dict.get("流通股", 0))
+            if float_shares > 0 and volume > 0:
+                turnover_rate = round(volume / float_shares * 100, 2)
+        except Exception as e:
+            logger.debug(f"Individual info failed for {code}: {e}")
+
+        return {
+            "code": code,
+            "name": name,
+            "price": price,
+            "change_pct": round(change_pct, 2),
+            "change_amount": round(change_amount, 2),
+            "volume": volume,
+            "amount": amount,
+            "open": today_open,
+            "high": high,
+            "low": low,
+            "prev_close": prev_close,
+            "turnover_rate": turnover_rate,
+            "pe": pe,
+            "pb": pb,
+            "total_market_cap": total_mv,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def _quote_em(self, code: str) -> dict:
+        """Fallback: get realtime quote from EastMoney full market data."""
         df = ak.stock_zh_a_spot_em()
         row = df[df["代码"] == code]
         if row.empty:
-            raise ValueError(f"Stock not found: {symbol}")
+            raise ValueError(f"Stock not found: {code}")
         r = row.iloc[0]
         return {
             "code": str(r["代码"]),
@@ -95,11 +168,15 @@ class StockDataFetcher:
                 logger.info(f"Cache hit for {code} [{start_norm}, {end_norm}]")
                 return cached
 
-        # Fetch from source
+        # Fetch from source (try AKShare first, fallback to BaoStock)
+        df = None
         if source == "baostock":
             df = self._fetch_baostock(code, start_norm, end_norm, adjust)
         else:
             df = self._fetch_akshare(code, start_date, end_date, adjust)
+            if df is None or df.empty:
+                logger.info(f"AKShare failed for {code}, falling back to BaoStock")
+                df = self._fetch_baostock(code, start_norm, end_norm, adjust)
 
         if df is not None and not df.empty:
             self.cache.store_daily(code, df)
@@ -231,24 +308,66 @@ class StockDataFetcher:
     # --- Financial Data ---
 
     def get_financial_data(self, symbol: str) -> dict:
-        """Get fundamental data: PE, PB, ROE, market_cap, etc."""
+        """Get fundamental data: PE, PB, ROE, market_cap, etc.
+
+        Combines data from:
+        - stock_individual_info_em: market cap, shares
+        - stock_financial_analysis_indicator: ROE, profit margins
+        - Computed PE/PB from price and financial data
+        """
         code = self._resolve_symbol(symbol)
+        result = {"code": code}
+
+        # Get basic info (market cap, shares)
         try:
-            df = ak.stock_a_indicator_lg(symbol=code)
-            if df.empty:
-                return {}
-            latest = df.iloc[-1]
-            return {
-                "code": code,
-                "pe_ttm": float(latest.get("pe_ttm", 0)) if latest.get("pe_ttm") else None,
-                "pb": float(latest.get("pb", 0)) if latest.get("pb") else None,
-                "ps_ttm": float(latest.get("ps_ttm", 0)) if latest.get("ps_ttm") else None,
-                "dv_ttm": float(latest.get("dv_ttm", 0)) if latest.get("dv_ttm") else None,
-                "total_mv": float(latest.get("total_mv", 0)) if latest.get("total_mv") else None,
-            }
+            info_df = ak.stock_individual_info_em(symbol=code)
+            info_dict = dict(zip(info_df["item"], info_df["value"]))
+            result["total_mv"] = float(info_dict.get("总市值", 0))
+            result["float_mv"] = float(info_dict.get("流通市值", 0))
+            result["industry"] = info_dict.get("行业", "")
         except Exception as e:
-            logger.error(f"Financial data fetch failed for {code}: {e}")
-            return {}
+            logger.warning(f"Individual info failed for {code}: {e}")
+
+        # Get financial indicators (ROE, profit margins, etc.)
+        try:
+            fin_df = ak.stock_financial_analysis_indicator(symbol=code, start_year="2024")
+            if not fin_df.empty:
+                latest = fin_df.iloc[-1]
+                result["roe"] = self._safe_float(latest.get("净资产收益率(%)"))
+                result["gross_margin"] = self._safe_float(latest.get("销售毛利率(%)"))
+                result["net_margin"] = self._safe_float(latest.get("销售净利率(%)"))
+                result["revenue_growth"] = self._safe_float(latest.get("主营业务收入增长率(%)"))
+                result["profit_growth"] = self._safe_float(latest.get("净利润增长率(%)"))
+                result["eps"] = self._safe_float(latest.get("摊薄每股收益(元)"))
+                result["bps"] = self._safe_float(latest.get("每股净资产_调整后(元)"))
+                result["debt_ratio"] = self._safe_float(latest.get("资产负债率(%)"))
+                result["current_ratio"] = self._safe_float(latest.get("流动比率"))
+                result["report_date"] = str(latest.get("日期", ""))
+
+                # Compute PE and PB from price
+                quote = self._quote_sina(code)
+                price = quote.get("price", 0)
+                if price > 0:
+                    eps = result.get("eps")
+                    bps = result.get("bps")
+                    if eps and eps > 0:
+                        result["pe_ttm"] = round(price / eps, 2)
+                    if bps and bps > 0:
+                        result["pb"] = round(price / bps, 2)
+        except Exception as e:
+            logger.warning(f"Financial analysis failed for {code}: {e}")
+
+        return result
+
+    @staticmethod
+    def _safe_float(val) -> float | None:
+        """Safely convert to float, returning None for invalid values."""
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
 
     # --- Helpers ---
 

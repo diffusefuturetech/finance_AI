@@ -63,15 +63,17 @@ class DataCache:
         cols = ["symbol", "date", "open", "close", "high", "low", "volume", "amount", "factor"]
         available_cols = [c for c in cols if c in records.columns]
         records = records[available_cols]
-        records.to_sql("daily_ohlcv", self.conn, if_exists="append", index=False,
-                       method="multi")
-        # Handle duplicates by keeping latest
-        self.conn.execute("""
-            DELETE FROM daily_ohlcv WHERE rowid NOT IN (
-                SELECT MIN(rowid) FROM daily_ohlcv GROUP BY symbol, date
+
+        # Use INSERT OR REPLACE to handle duplicates
+        placeholders = ", ".join(["?"] * len(available_cols))
+        col_names = ", ".join(available_cols)
+        for _, row in records.iterrows():
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO daily_ohlcv ({col_names}) VALUES ({placeholders})",
+                tuple(row[c] for c in available_cols),
             )
-        """)
         self.conn.commit()
+
         # Update log
         latest = df["date"].max()
         self.conn.execute(
