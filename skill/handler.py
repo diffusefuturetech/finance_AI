@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import ensure_dirs
 from data.cache import DataCache
 from data.fetcher import StockDataFetcher
+from data.web_collector import WebCollector
 from analysis.technical import TechnicalAnalyzer
 from analysis.factor import FactorEngine
 from analysis.screener import StockScreener, ScreenCriteria
@@ -38,6 +39,7 @@ class SkillHandler:
         self.factor_engine = FactorEngine()
         self.plotter = ChartPlotter()
         self.formatter = LarkFormatter()
+        self.web_collector = WebCollector()
         self._reporter = None
 
     @property
@@ -121,7 +123,7 @@ class SkillHandler:
             return self.formatter.format_error(f"选股失败: {e}")
 
     def handle_analyze(self, target: str, export_docx: bool = False) -> str:
-        """Handle full AI analysis report generation."""
+        """Handle full AI analysis report generation with comprehensive web data."""
         try:
             # Get real-time quote
             code = self.fetcher._resolve_symbol(target)
@@ -168,8 +170,19 @@ class SkillHandler:
             except Exception as e:
                 logger.warning(f"Historical valuation chart failed: {e}")
 
-            # Generate AI report
-            report = self.reporter.generate_stock_report(
+            # Collect web data (news, ratings, fund flow, etc.)
+            logger.info(f"Collecting web data for {code}...")
+            web_data = self.web_collector.collect_all(code)
+            web_data_text = self.web_collector.format_for_llm(web_data)
+            collected_count = sum(1 for v in web_data.values() if v)
+            logger.info(f"Web data collected: {collected_count}/8 modules")
+
+            # Update market cap from fundamental if missing in quote
+            if quote.get("total_market_cap", 0) == 0 and fundamental.get("total_mv"):
+                quote["total_market_cap"] = fundamental["total_mv"]
+
+            # Generate comprehensive AI report with buy/sell recommendation
+            report = self.reporter.generate_comprehensive_report(
                 symbol=code,
                 name=name,
                 quote=quote,
@@ -177,6 +190,7 @@ class SkillHandler:
                 fundamental_data=fundamental,
                 factor_score=factor_score,
                 factor_scores=factor_scores,
+                web_collected_data=web_data_text,
             )
 
             # Export to Word if requested
@@ -194,6 +208,7 @@ class SkillHandler:
                     technical_chart_path=chart_path,
                     radar_chart_path=radar_path,
                     valuation_chart_path=valuation_path,
+                    web_data=web_data,
                 )
                 return f"Word报告已生成: {docx_path}"
 
@@ -203,7 +218,7 @@ class SkillHandler:
                 "",
                 self.formatter.format_technical_signals(signals, chart_path),
                 "",
-                "## AI 分析报告",
+                "## AI 综合分析报告（含投资建议）",
                 "",
                 report,
             ]

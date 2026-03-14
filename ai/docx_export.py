@@ -102,6 +102,125 @@ class DocxExporter:
             return COLOR_ORANGE
         return None
 
+    def _add_web_data_sections(self, doc, web_data: dict, start_num: int):
+        """Add web-collected data sections to the document."""
+        cn_nums = "一二三四五六七八九十十一十二十三十四十五"
+        sec = start_num
+
+        # --- News ---
+        news = web_data.get("news")
+        if news:
+            sec += 1
+            idx = min(sec - 1, len(cn_nums) // 1)
+            num_char = cn_nums[sec - 1] if sec <= 10 else str(sec)
+            doc.add_heading(f"{num_char}、近期新闻舆情", level=1)
+            for n in news[:8]:
+                p = doc.add_paragraph(style="List Bullet")
+                time_run = p.add_run(f"[{n.get('time', '')}] ")
+                time_run.font.size = Pt(8)
+                time_run.font.color.rgb = COLOR_GRAY
+                title_run = p.add_run(n.get("title", ""))
+                title_run.font.size = Pt(10)
+
+        # --- Ratings ---
+        ratings = web_data.get("ratings")
+        if ratings:
+            sec += 1
+            num_char = cn_nums[sec - 1] if sec <= 10 else str(sec)
+            doc.add_heading(f"{num_char}、机构评级汇总", level=1)
+
+            # Rating distribution
+            rd = ratings.get("rating_distribution", {})
+            if rd:
+                dist_rows = [[k, str(v)] for k, v in rd.items()]
+                self._add_styled_table(doc, ["评级", "数量"], dist_rows)
+                doc.add_paragraph()
+
+            # Target price range
+            tp = ratings.get("target_price_range", {})
+            if tp.get("avg"):
+                tp_para = doc.add_paragraph()
+                tp_para.add_run(
+                    f"目标价区间: {tp.get('min','?'):.2f} - {tp.get('max','?'):.2f}元, "
+                    f"均值 {tp['avg']:.2f}元"
+                ).font.size = Pt(10)
+
+            # Recent reports
+            details = ratings.get("details", [])
+            if details:
+                report_rows = []
+                for r in details[:8]:
+                    report_rows.append([
+                        r.get("date", "")[:10],
+                        r.get("broker", ""),
+                        r.get("rating", ""),
+                        f"¥{r['target_price']:.2f}" if r.get("target_price") else "N/A",
+                    ])
+                self._add_styled_table(doc, ["日期", "机构", "评级", "目标价"], report_rows)
+
+        # --- Fund Flow ---
+        fund_flow = web_data.get("fund_flow")
+        if fund_flow and fund_flow.get("daily"):
+            sec += 1
+            num_char = cn_nums[sec - 1] if sec <= 10 else str(sec)
+            doc.add_heading(f"{num_char}、资金流向分析", level=1)
+
+            total = fund_flow.get("main_net_5d")
+            if total is not None:
+                direction = "净流入" if total > 0 else "净流出"
+                summary = doc.add_paragraph()
+                run = summary.add_run(
+                    f"近5日主力资金{direction}: {abs(total)/1e4:.1f}万元"
+                )
+                run.font.size = Pt(11)
+                run.font.bold = True
+                run.font.color.rgb = COLOR_RED if total > 0 else COLOR_GREEN
+
+            flow_rows = []
+            for f in fund_flow["daily"][:5]:
+                net = f.get("main_net_inflow")
+                net_str = f"{net/1e4:+.1f}万" if net is not None else "N/A"
+                flow_rows.append([
+                    f.get("date", ""),
+                    net_str,
+                    f"{f.get('main_net_pct', 'N/A')}%",
+                ])
+            color_rules = {}
+            for i, f in enumerate(fund_flow["daily"][:5]):
+                net = f.get("main_net_inflow")
+                if net is not None:
+                    color_rules[(i, 1)] = COLOR_RED if net > 0 else COLOR_GREEN
+            self._add_colored_table(
+                doc, ["日期", "主力净流入", "占比"], flow_rows, color_rules
+            )
+
+        # --- Top Holders ---
+        holders = web_data.get("holders")
+        if holders and holders.get("holders"):
+            sec += 1
+            num_char = cn_nums[sec - 1] if sec <= 10 else str(sec)
+            doc.add_heading(f"{num_char}、十大流通股东", level=1)
+
+            rd = holders.get("report_date", "")
+            if rd:
+                p = doc.add_paragraph()
+                run = p.add_run(f"截止日期: {rd}")
+                run.font.size = Pt(9)
+                run.font.color.rgb = COLOR_GRAY
+
+            holder_rows = []
+            for h in holders["holders"][:10]:
+                pct = f"{h['pct']:.2f}%" if h.get("pct") else "N/A"
+                holder_rows.append([
+                    h.get("name", "")[:20],
+                    pct,
+                    h.get("change", ""),
+                    h.get("holder_type", ""),
+                ])
+            self._add_styled_table(
+                doc, ["股东名称", "持股比例", "增减", "性质"], holder_rows
+            )
+
     def generate_stock_report(
         self,
         symbol: str,
@@ -114,6 +233,7 @@ class DocxExporter:
         technical_chart_path: str | None = None,
         radar_chart_path: str | None = None,
         valuation_chart_path: str | None = None,
+        web_data: dict | None = None,
     ) -> str:
         """Generate a complete stock analysis Word document."""
         doc = Document()
@@ -345,6 +465,14 @@ class DocxExporter:
                 doc.add_paragraph()
                 doc.add_picture(radar_chart_path, width=Inches(5))
                 doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # ===== Web Collected Data Sections =====
+        if web_data:
+            self._add_web_data_sections(doc, web_data, section_num)
+            # Count how many sections were added
+            web_sections = sum(1 for k in ["news", "ratings", "fund_flow", "holders"]
+                               if web_data.get(k))
+            section_num += web_sections
 
         # ===== AI Commentary =====
         if ai_commentary:
