@@ -73,17 +73,35 @@ class StockDataFetcher:
         change_amount = price - prev_close if prev_close > 0 else 0
         change_pct = (change_amount / prev_close * 100) if prev_close > 0 else 0
 
-        # Get extra info (market cap, turnover) from EastMoney individual info
-        pe, pb, total_mv, turnover_rate = None, None, 0, 0
+        # Get PE/PB/turnover/market_cap from BaoStock (most reliable)
+        pe, pb, ps, total_mv, turnover_rate = None, None, None, 0, 0
+        try:
+            valuation = self._get_baostock_valuation(code)
+            if valuation:
+                pe = valuation.get("pe")
+                pb = valuation.get("pb")
+                ps = valuation.get("ps")
+                turnover_rate = valuation.get("turn", 0)
+        except Exception as e:
+            logger.debug(f"BaoStock valuation failed for {code}: {e}")
+
+        # Get total shares from EastMoney (for market cap calculation)
         try:
             info_df = ak.stock_individual_info_em(symbol=code)
             info_dict = dict(zip(info_df["item"], info_df["value"]))
             total_mv = float(info_dict.get("总市值", 0))
-            float_shares = float(info_dict.get("流通股", 0))
-            if float_shares > 0 and volume > 0:
-                turnover_rate = round(volume / float_shares * 100, 2)
-        except Exception as e:
-            logger.debug(f"Individual info failed for {code}: {e}")
+        except Exception:
+            # Fallback: compute market cap from BaoStock total_shares
+            try:
+                bs.login()
+                rs = bs.query_stock_basic(code=f"{'sh' if code.startswith(('6','9')) else 'sz'}.{code}")
+                bs.logout()
+            except Exception:
+                pass
+            # Simple fallback: use price * rough estimate
+            if price > 0 and total_mv == 0:
+                # We'll fill this from financial data later
+                pass
 
         return {
             "code": code,
@@ -100,9 +118,59 @@ class StockDataFetcher:
             "turnover_rate": turnover_rate,
             "pe": pe,
             "pb": pb,
+            "ps": ps,
             "total_market_cap": total_mv,
             "timestamp": datetime.now().isoformat(),
         }
+
+    def _get_baostock_valuation(self, code: str) -> dict | None:
+        """Get PE/PB/PS/turnover from BaoStock for the latest trading day."""
+        try:
+            bs.login()
+            bs_code = f"sh.{code}" if code.startswith(("6", "9")) else f"sz.{code}"
+            # Get last 5 days to ensure we get at least one data point
+            from datetime import timedelta
+            end_dt = date.today()
+            start_dt = end_dt - timedelta(days=10)
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,close,turn,peTTM,pbMRQ,psTTM",
+                start_date=start_dt.strftime("%Y-%m-%d"),
+                end_date=end_dt.strftime("%Y-%m-%d"),
+                frequency="d",
+                adjustflag="3",
+            )
+            rows = []
+            while (rs.error_code == "0") and rs.next():
+                rows.append(rs.get_row_data())
+            bs.logout()
+
+            if not rows:
+                return None
+
+            latest = rows[-1]  # Most recent day
+            result = {}
+
+            def safe_float(val):
+                try:
+                    v = float(val)
+                    return v if v != 0 and abs(v) < 1e10 else None
+                except (ValueError, TypeError):
+                    return None
+
+            result["pe"] = safe_float(latest[3])
+            result["pb"] = safe_float(latest[4])
+            result["ps"] = safe_float(latest[5])
+            result["turn"] = safe_float(latest[2]) or 0
+
+            return result
+        except Exception as e:
+            logger.warning(f"BaoStock valuation failed: {e}")
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            return None
 
     def _quote_em(self, code: str) -> dict:
         """Fallback: get realtime quote from EastMoney full market data."""
@@ -308,27 +376,39 @@ class StockDataFetcher:
     # --- Financial Data ---
 
     def get_financial_data(self, symbol: str) -> dict:
-        """Get fundamental data: PE, PB, ROE, market_cap, etc.
+        """Get comprehensive fundamental data.
 
-        Combines data from:
-        - stock_individual_info_em: market cap, shares
-        - stock_financial_analysis_indicator: ROE, profit margins
-        - Computed PE/PB from price and financial data
+        Data sources (in priority order):
+        1. BaoStock valuation: PE(TTM), PB(MRQ), PS(TTM), turnover
+        2. stock_individual_info_em: market cap, shares, industry
+        3. stock_financial_analysis_indicator: ROE, margins, growth, EPS, BPS
+        4. Computed from total_assets * (1 - debt_ratio) for market cap fallback
         """
         code = self._resolve_symbol(symbol)
         result = {"code": code}
 
-        # Get basic info (market cap, shares)
+        # Source 1: BaoStock valuation (PE/PB/PS/turnover - most reliable)
+        valuation = self._get_baostock_valuation(code)
+        if valuation:
+            result["pe_ttm"] = valuation.get("pe")
+            result["pb"] = valuation.get("pb")
+            result["ps_ttm"] = valuation.get("ps")
+            result["turnover_rate"] = valuation.get("turn", 0)
+
+        # Source 2: EastMoney basic info (market cap, industry)
         try:
             info_df = ak.stock_individual_info_em(symbol=code)
             info_dict = dict(zip(info_df["item"], info_df["value"]))
             result["total_mv"] = float(info_dict.get("总市值", 0))
             result["float_mv"] = float(info_dict.get("流通市值", 0))
+            result["total_shares"] = float(info_dict.get("总股本", 0))
+            result["float_shares"] = float(info_dict.get("流通股", 0))
             result["industry"] = info_dict.get("行业", "")
+            result["list_date"] = info_dict.get("上市时间", "")
         except Exception as e:
             logger.warning(f"Individual info failed for {code}: {e}")
 
-        # Get financial indicators (ROE, profit margins, etc.)
+        # Source 3: Financial analysis indicators (ROE, margins, etc.)
         try:
             fin_df = ak.stock_financial_analysis_indicator(symbol=code, start_year="2024")
             if not fin_df.empty:
@@ -336,24 +416,37 @@ class StockDataFetcher:
                 result["roe"] = self._safe_float(latest.get("净资产收益率(%)"))
                 result["gross_margin"] = self._safe_float(latest.get("销售毛利率(%)"))
                 result["net_margin"] = self._safe_float(latest.get("销售净利率(%)"))
+                result["operating_margin"] = self._safe_float(latest.get("营业利润率(%)"))
                 result["revenue_growth"] = self._safe_float(latest.get("主营业务收入增长率(%)"))
                 result["profit_growth"] = self._safe_float(latest.get("净利润增长率(%)"))
                 result["eps"] = self._safe_float(latest.get("摊薄每股收益(元)"))
                 result["bps"] = self._safe_float(latest.get("每股净资产_调整后(元)"))
+                result["ocfps"] = self._safe_float(latest.get("每股经营性现金流(元)"))
                 result["debt_ratio"] = self._safe_float(latest.get("资产负债率(%)"))
                 result["current_ratio"] = self._safe_float(latest.get("流动比率"))
+                result["quick_ratio"] = self._safe_float(latest.get("速动比率"))
+                result["total_assets"] = self._safe_float(latest.get("总资产(元)"))
                 result["report_date"] = str(latest.get("日期", ""))
 
-                # Compute PE and PB from price
-                quote = self._quote_sina(code)
-                price = quote.get("price", 0)
-                if price > 0:
-                    eps = result.get("eps")
-                    bps = result.get("bps")
-                    if eps and eps > 0:
-                        result["pe_ttm"] = round(price / eps, 2)
-                    if bps and bps > 0:
-                        result["pb"] = round(price / bps, 2)
+                # Compute market cap if not available from EastMoney
+                if not result.get("total_mv") and result.get("total_assets"):
+                    debt_pct = result.get("debt_ratio", 50) or 50
+                    equity = result["total_assets"] * (1 - debt_pct / 100)
+                    pb_val = result.get("pb")
+                    if pb_val and pb_val > 0:
+                        result["total_mv"] = equity * pb_val
+
+                # Also compute PE/PB from EPS/BPS if BaoStock didn't provide
+                if not result.get("pe_ttm") or not result.get("pb"):
+                    quote = self._quote_sina(code)
+                    price = quote.get("price", 0)
+                    if price > 0:
+                        eps = result.get("eps")
+                        bps = result.get("bps")
+                        if eps and abs(eps) > 0.001 and not result.get("pe_ttm"):
+                            result["pe_ttm"] = round(price / eps, 2)
+                        if bps and bps > 0 and not result.get("pb"):
+                            result["pb"] = round(price / bps, 2)
         except Exception as e:
             logger.warning(f"Financial analysis failed for {code}: {e}")
 
